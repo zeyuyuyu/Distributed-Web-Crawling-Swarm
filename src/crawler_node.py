@@ -1,92 +1,49 @@
-import zmq
-import time
-from typing import Dict, List, Optional
-from dataclasses import dataclass
-from urllib.parse import urlparse
-
-@dataclass
-class CrawlTask:
-    url: str
-    depth: int
-    domain: str
-    visited: List[str]
+import asyncio
+import aiohttp
+from collections import deque
 
 class CrawlerNode:
-    def __init__(self, node_id: str, coordinator_address: str):
-        self.node_id = node_id
-        self.context = zmq.Context()
-        self.task_socket = self.context.socket(zmq.DEALER)
-        self.task_socket.setsockopt_string(zmq.IDENTITY, node_id)
-        self.task_socket.connect(coordinator_address)
-        
-        self.result_socket = self.context.socket(zmq.PUSH)
-        self.result_socket.connect(coordinator_address.replace('5555', '5556'))
-        
-        self.active_tasks: Dict[str, CrawlTask] = {}
-        self.is_running = False
+    def __init__(self, url_queue, page_store):
+        self.url_queue = url_queue
+        self.page_store = page_store
+        self.task_queue = asyncio.Queue()
+        self.worker_tasks = []
 
-    def start(self):
-        self.is_running = True
-        self.register_with_coordinator()
-        
-        while self.is_running:
+    async def run(self):
+        await asyncio.gather(
+            self.worker_loop(),
+            self.feed_queue()
+        )
+
+    async def worker_loop(self):
+        while True:
+            url = await self.task_queue.get()
             try:
-                if self.task_socket.poll(timeout=1000):
-                    msg = self.task_socket.recv_json()
-                    self.handle_message(msg)
+                page = await self.fetch_page(url)
+                self.page_store.add_page(page)
+                self.url_queue.add_urls(page.outlinks)
             except Exception as e:
-                print(f"Error in node {self.node_id}: {str(e)}")
+                print(f'Error fetching {url}: {e}')
+            finally:
+                self.task_queue.task_done()
 
-    def register_with_coordinator(self):
-        msg = {
-            'type': 'register',
-            'node_id': self.node_id,
-            'capacity': 10  # Max parallel tasks
-        }
-        self.task_socket.send_json(msg)
+    async def feed_queue(self):
+        while True:
+            url = await self.url_queue.get_url()
+            await self.task_queue.put(url)
 
-    def handle_message(self, msg: Dict):
-        msg_type = msg.get('type')
-        
-        if msg_type == 'crawl_task':
-            task = CrawlTask(
-                url=msg['url'],
-                depth=msg['depth'],
-                domain=urlparse(msg['url']).netloc,
-                visited=msg.get('visited', [])
-            )
-            self.process_task(task)
-        
-        elif msg_type == 'stop':
-            self.is_running = False
+    async def fetch_page(self, url):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                content = await response.text()
+                return Page(url, content)
 
-    def process_task(self, task: CrawlTask):
-        # Simulate crawling
-        time.sleep(1)
-        
-        result = {
-            'type': 'crawl_result',
-            'node_id': self.node_id,
-            'url': task.url,
-            'links': [f'http://{task.domain}/page{i}' for i in range(3)],
-            'status': 'success'
-        }
-        
-        self.result_socket.send_json(result)
+class Page:
+    def __init__(self, url, content):
+        self.url = url
+        self.content = content
+        self.outlinks = self.extract_outlinks(content)
 
-    def stop(self):
-        self.is_running = False
-        self.task_socket.close()
-        self.result_socket.close()
-        self.context.term()
-
-if __name__ == '__main__':
-    import sys
-    node = CrawlerNode(
-        node_id=sys.argv[1] if len(sys.argv) > 1 else f'node_{time.time()}',
-        coordinator_address='tcp://localhost:5555'
-    )
-    try:
-        node.start()
-    except KeyboardInterrupt:
-        node.stop()
+    def extract_outlinks(self, content):
+        # Implement logic to extract outlinks from page content
+        return ['https://example.com/link1', 'https://example.com/link2']
